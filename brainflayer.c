@@ -528,6 +528,19 @@ int main(int argc, char **argv) {
   
   // 新增参数
   int num_threads = 0; // 0表示自动检测
+  
+  // 添加缺失的变量声明
+  unsigned char priv[64];
+  hash160_t hash160;
+  pubhashfn_t pubhashfn[8];
+  memset(pubhashfn, 0, sizeof(pubhashfn));
+  
+  int batch_stopped = -1;
+  char *batch_line[BATCH_MAX];
+  size_t batch_line_sz[BATCH_MAX];
+  int batch_line_read[BATCH_MAX];
+  unsigned char batch_priv[BATCH_MAX][32];
+  unsigned char batch_upub[BATCH_MAX][65];
 
   // 初始化CURL
   curl_global_init(CURL_GLOBAL_DEFAULT);
