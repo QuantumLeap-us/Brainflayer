@@ -32,6 +32,8 @@
 #include "algo/brainwalletio.h"
 #include "algo/sha3.h"
 
+#include <curl/curl.h>
+
 // raise this if you really want, but quickly diminishing returns
 #define BATCH_MAX 4096
 
@@ -368,7 +370,11 @@ void usage(unsigned char *name) {
  -m FILE                     load ecmult table from FILE\n\
                              the ecmtabgen tool can build such a table\n\
  -v                          verbose - display cracking progress\n\
- -h                          show this help\n", name, BATCH_MAX);
+ -h                          show this help\n\
+ -A                          enable API notifications\n\
+ -K                          API key for notifications\n\
+ -C                          coin type for notifications\n\
+ -T                          number of threads to use\n", name, BATCH_MAX);
 //q, --quiet                 suppress non-error messages
   exit(1);
 }
@@ -399,6 +405,9 @@ int main(int argc, char **argv) {
   unsigned char *topt = NULL, *sopt = NULL, *popt = NULL;
   unsigned char *mopt = NULL, *fopt = NULL, *ropt = NULL;
   unsigned char *Iopt = NULL, *copt = NULL;
+  
+  // 新增参数
+  int num_threads = 0; // 0表示自动检测
 
   unsigned char priv[64];
   hash160_t hash160;
@@ -412,7 +421,10 @@ int main(int argc, char **argv) {
   unsigned char batch_priv[BATCH_MAX][32];
   unsigned char batch_upub[BATCH_MAX][65];
 
-  while ((c = getopt(argc, argv, "avxb:hi:k:f:m:n:o:p:s:r:c:t:w:I:N:B:")) != -1) {
+  // 初始化CURL
+  curl_global_init(CURL_GLOBAL_DEFAULT);
+
+  while ((c = getopt(argc, argv, "avxb:hi:k:f:m:n:o:p:s:r:c:t:w:I:N:B:A:K:C:T:")) != -1) {
     switch (c) {
       case 'a':
         aopt = 1; // open output file in append mode
@@ -482,6 +494,21 @@ int main(int argc, char **argv) {
         // show help
         usage(argv[0]);
         return 0;
+      case 'A':
+        api_notify_enabled = 1;
+        api_endpoint = optarg;
+        break;
+      case 'K':
+        api_key = optarg;
+        break;
+      case 'C':
+        coin_type = optarg;
+        break;
+      case 'T':
+        num_threads = atoi(optarg);
+        if (num_threads < 1) num_threads = 1;
+        if (num_threads > MAX_THREADS) num_threads = MAX_THREADS;
+        break;
       case '?':
         // show error
         return 1;
@@ -877,6 +904,9 @@ int main(int argc, char **argv) {
       break;
     }
   }
+
+  // 清理CURL
+  curl_global_cleanup();
 
   return 0;
 }
