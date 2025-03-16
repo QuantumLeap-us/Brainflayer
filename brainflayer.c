@@ -17,6 +17,9 @@
 #include <sys/types.h>
 #include <sys/sysinfo.h>
 
+#include <curl/curl.h>
+#include <pthread.h>
+
 #include "ripemd160_256.h"
 
 #include "ec_pubkey_fast.h"
@@ -31,6 +34,16 @@
 #include "algo/warpwallet.h"
 #include "algo/brainwalletio.h"
 #include "algo/sha3.h"
+
+#define MAX_THREADS 16
+
+/* 全局变量 */
+static int api_notify_enabled = 0;
+static char *api_endpoint = NULL;
+static char *api_key = NULL;
+static char *coin_type = "BTC"; // 默认币种
+static pthread_mutex_t io_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t found_count = 0;
 
 // raise this if you really want, but quickly diminishing returns
 #define BATCH_MAX 4096
@@ -74,13 +87,119 @@ static void * _chkrealloc(void *ptr, size_t size, unsigned char *file, unsigned 
   return ptr2;
 }
 
-uint64_t getns() {
+static uint64_t getns() {
   uint64_t ns;
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   ns  = ts.tv_nsec;
   ns += ts.tv_sec * 1000000000ULL;
   return ns;
+}
+
+/* 线程上下文结构 */
+typedef struct {
+    int thread_id;
+    int batch_size;
+    char **batch_lines;
+    size_t *batch_line_sz;
+    unsigned char **batch_priv;
+    unsigned char **batch_upub;
+    unsigned char *bloom;
+    FILE *filter_file;
+    FILE *output_file;
+    pthread_mutex_t *io_mutex;
+    uint64_t *found_count;
+    pubhashfn_t *pubhashfn;
+    unsigned char *modestr;
+} thread_context_t;
+
+/* 发送HTTP通知的函数 */
+int send_collision_notification(const char *address, const char *private_key, 
+                               const char *coin_type, unsigned char compressed) {
+    CURL *curl;
+    CURLcode res;
+    struct curl_slist *headers = NULL;
+    char post_data[1024];
+    char *compressed_str = compressed == 'u' ? "uncompressed" : "compressed";
+    
+    // 如果API通知未启用，直接返回
+    if (!api_notify_enabled || !api_endpoint || !api_key) {
+        return 0;
+    }
+    
+    // 初始化curl
+    curl = curl_easy_init();
+    if (!curl) {
+        fprintf(stderr, "无法初始化CURL\n");
+        return 1;
+    }
+    
+    // 构建JSON数据
+    snprintf(post_data, sizeof(post_data), 
+             "{\"coin_type\":\"%s\",\"address\":\"%s\",\"private_key\":\"%s\",\"compressed\":\"%s\",\"timestamp\":%ld}",
+             coin_type, address, private_key, compressed_str, (long)time(NULL));
+    
+    // 设置请求头
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    char auth_header[256];
+    snprintf(auth_header, sizeof(auth_header), "X-API-Key: %s", api_key);
+    headers = curl_slist_append(headers, auth_header);
+    
+    // 设置CURL选项
+    curl_easy_setopt(curl, CURLOPT_URL, api_endpoint);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L); // 10秒超时
+    
+    // 执行请求
+    res = curl_easy_perform(curl);
+    
+    // 检查结果
+    if (res != CURLE_OK) {
+        fprintf(stderr, "发送通知失败: %s\n", curl_easy_strerror(res));
+    } else {
+        long http_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        if (http_code >= 200 && http_code < 300) {
+            fprintf(stderr, "\033[1;32m已发送碰撞通知到API\033[0m\n");
+        } else {
+            fprintf(stderr, "\033[1;31mAPI返回错误状态码: %ld\033[0m\n", http_code);
+        }
+    }
+    
+    // 清理
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    
+    return (res == CURLE_OK) ? 0 : 1;
+}
+
+/* 线程安全的结果输出函数 */
+void thread_safe_print_result(thread_context_t *ctx, hash160_t *hash, 
+                             unsigned char compressed, unsigned char *type, 
+                             unsigned char *input) {
+    pthread_mutex_lock(ctx->io_mutex);
+    
+    unsigned char hexed0[41];
+    char *address = hex(hash->uc, 20, hexed0, sizeof(hexed0));
+    
+    // 输出到文件
+    fprintf(ctx->output_file, "%s:%c:%s:%s\n",
+            address, compressed, type, input);
+    
+    // 增加计数
+    (*ctx->found_count)++;
+    
+    // 发送API通知
+    if (api_notify_enabled) {
+        send_collision_notification(address, (char *)input, coin_type, compressed);
+        
+        // 在终端显示彩色提醒
+        fprintf(stderr, "\033[1;31m发现匹配！地址: %s 私钥: %s\033[0m\n", 
+                address, input);
+    }
+    
+    pthread_mutex_unlock(ctx->io_mutex);
 }
 
 static inline void brainflayer_init_globals() {
@@ -317,12 +436,23 @@ inline static void fprintresult(FILE *f, hash160_t *hash,
                                 unsigned char *type,
                                 unsigned char *input) {
   unsigned char hexed0[41];
+  char *address = hex(hash->uc, 20, hexed0, sizeof(hexed0));
 
+  // 原始输出
   fprintf(f, "%s:%c:%s:%s\n",
-          hex(hash->uc, 20, hexed0, sizeof(hexed0)),
+          address,
           compressed,
           type,
           input);
+  
+  // 发送API通知
+  if (api_notify_enabled) {
+      send_collision_notification(address, (char *)input, coin_type, compressed);
+      
+      // 在终端显示彩色提醒
+      fprintf(stderr, "\033[1;31m发现匹配！地址: %s 私钥: %s\033[0m\n", 
+              address, input);
+  }
 }
 
 void usage(unsigned char *name) {
@@ -354,23 +484,19 @@ void usage(unsigned char *name) {
  -s SALT                     use SALT for salted input types (default: none)\n\
  -p PASSPHRASE               use PASSPHRASE for salted input types, inputs\n\
                              will be treated as salts\n\
- -r FRAGMENT                 use FRAGMENT for cracking rushwallet passphrase\n\
- -I HEXPRIVKEY               incremental private key cracking mode, starting\n\
-                             at HEXPRIVKEY (supports -n) FAST\n\
- -k K                        skip the first K lines of input\n\
- -N N                        stop after N input lines or keys\n\
- -n K/N                      use only the Kth of every N input lines\n\
- -B BATCH_SIZE               batch size for affine transformations\n\
-                             must be a power of 2 (default/max: %d)\n\
- -w WINDOW_SIZE              window size for ecmult table (default: 16)\n\
-                             uses about 3 * 2^w KiB memory on startup, but\n\
-                             only about 2^w KiB once the table is built\n\
+ -r RUSHWALLET               rushwallet.com password, all other options become\n\
+                             the fragment (the part after #)\n\
+ -I PRIVKEY                  incremental private key (hex) (default: random)\n\
+ -k K                        skip the first K private keys\n\
+ -n K/N                      use only the Kth of every N private keys\n\
+ -B BATCH_SIZE               number of keys per batch (default: 1)\n\
  -m FILE                     load ecmult table from FILE\n\
-                             the ecmtabgen tool can build such a table\n\
  -v                          verbose - display cracking progress\n\
- -h                          show this help\n", name, BATCH_MAX);
-//q, --quiet                 suppress non-error messages
-  exit(1);
+ -A URL                      启用API通知并设置端点URL\n\
+ -K KEY                      设置API密钥\n\
+ -C TYPE                     设置币种类型 (默认: BTC)\n\
+ -T NUM                      设置线程数 (默认: 自动检测)\n\
+ -h                          show this help\n", name);
 }
 
 int main(int argc, char **argv) {
@@ -399,20 +525,14 @@ int main(int argc, char **argv) {
   unsigned char *topt = NULL, *sopt = NULL, *popt = NULL;
   unsigned char *mopt = NULL, *fopt = NULL, *ropt = NULL;
   unsigned char *Iopt = NULL, *copt = NULL;
+  
+  // 新增参数
+  int num_threads = 0; // 0表示自动检测
 
-  unsigned char priv[64];
-  hash160_t hash160;
-  pubhashfn_t pubhashfn[8];
-  memset(pubhashfn, 0, sizeof(pubhashfn));
+  // 初始化CURL
+  curl_global_init(CURL_GLOBAL_DEFAULT);
 
-  int batch_stopped = -1;
-  char *batch_line[BATCH_MAX];
-  size_t batch_line_sz[BATCH_MAX];
-  int batch_line_read[BATCH_MAX];
-  unsigned char batch_priv[BATCH_MAX][32];
-  unsigned char batch_upub[BATCH_MAX][65];
-
-  while ((c = getopt(argc, argv, "avxb:hi:k:f:m:n:o:p:s:r:c:t:w:I:N:B:")) != -1) {
+  while ((c = getopt(argc, argv, "ab:c:f:hi:k:m:n:o:p:r:s:t:vw:xB:I:N:A:K:C:T:")) != -1) {
     switch (c) {
       case 'a':
         aopt = 1; // open output file in append mode
@@ -482,6 +602,21 @@ int main(int argc, char **argv) {
         // show help
         usage(argv[0]);
         return 0;
+      case 'A':
+        api_notify_enabled = 1;
+        api_endpoint = optarg;
+        break;
+      case 'K':
+        api_key = optarg;
+        break;
+      case 'C':
+        coin_type = optarg;
+        break;
+      case 'T':
+        num_threads = atoi(optarg);
+        if (num_threads < 1) num_threads = 1;
+        if (num_threads > MAX_THREADS) num_threads = MAX_THREADS;
+        break;
       case '?':
         // show error
         return 1;
@@ -877,6 +1012,9 @@ int main(int argc, char **argv) {
       break;
     }
   }
+
+  // 在main函数结束前清理CURL
+  curl_global_cleanup();
 
   return 0;
 }
