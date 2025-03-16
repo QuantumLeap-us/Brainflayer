@@ -18,8 +18,10 @@ fi
 
 # 添加detect_cpu函数定义
 echo "正在添加detect_cpu函数定义..."
-cat >> scrypt-jane/cpu-detection.h << 'EOF'
+cat > scrypt-jane/cpu-detection.h << 'EOF'
 /* CPU检测函数 */
+#include <stddef.h>
+
 size_t detect_cpu(void) {
     return 0; /* 返回0表示使用通用实现 */
 }
